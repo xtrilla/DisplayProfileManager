@@ -11,23 +11,59 @@ namespace DisplayProfileManager.Helpers
     public class AudioHelper
     {
         private static readonly Logger logger = LoggerHelper.GetLogger();
-        private static CoreAudioController _audioController;
-        
+
+        // Backing field for the audio controller. Accessed via the _audioController
+        // property below which lazy-initialises on first use.
+        // Reason: CoreAudioController subscribes to WASAPI session change notifications
+        // via IMMNotificationClient at construction time. With heavy audio-using apps
+        // active (modern Outlook, browsers, Teams) those notifications fire constantly,
+        // generating ~200 outbound RPC calls/sec from this process at idle. Deferring
+        // creation until a profile that actually uses audio is applied/saved keeps the
+        // app silent on workstations that don't switch audio devices in profiles.
+        // See https://github.com/zac15987/DisplayProfileManager/issues/10
+        private static CoreAudioController _backingController;
+        private static readonly object _initLock = new object();
+        private static bool _audioInitAttempted = false;
+
         // Device-specific caching to prevent cross-device contamination
         private static readonly Dictionary<string, string> _deviceSpecificNameCache = new Dictionary<string, string>();
         private static readonly Dictionary<string, DateTime> _deviceSpecificDiscoveryTime = new Dictionary<string, DateTime>();
         private static readonly object _cachelock = new object();
 
+        // Lazy property: existing call sites read this field-style. First read creates
+        // the controller; subsequent reads return the cached instance. If construction
+        // fails, returns null and remembers the failure (won't retry).
+        private static CoreAudioController _audioController
+        {
+            get
+            {
+                if (_backingController != null) return _backingController;
+                lock (_initLock)
+                {
+                    if (_backingController != null) return _backingController;
+                    if (!_audioInitAttempted)
+                    {
+                        _audioInitAttempted = true;
+                        try
+                        {
+                            logger.Info("Lazy-initialising CoreAudioController on first audio operation");
+                            _backingController = new CoreAudioController();
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Error(ex, "Failed to initialize CoreAudioController");
+                        }
+                    }
+                    return _backingController;
+                }
+            }
+        }
+
         public static void InitializeAudio()
         {
-            try
-            {
-                _audioController = new CoreAudioController();
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Failed to initialize CoreAudioController");
-            }
+            // No-op: CoreAudioController is now lazy-initialised on first audio
+            // operation. Kept for API compatibility with existing call sites.
+            logger.Debug("InitializeAudio: deferred -- controller will be created on first use");
         }
 
         public class AudioDeviceInfo
@@ -679,28 +715,25 @@ namespace DisplayProfileManager.Helpers
 
         public static void Dispose()
         {
-            try
+            lock (_initLock)
             {
-                _audioController?.Dispose();
-                _audioController = null;
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error disposing AudioController");
+                try
+                {
+                    _backingController?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    logger.Error(ex, "Error disposing AudioController");
+                }
+                _backingController = null;
+                _audioInitAttempted = false;
             }
         }
 
         public static void ReInitializeAudioController()
         {
-            try
-            {
-                Dispose();
-                _audioController = new CoreAudioController();
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error re-initializing AudioController");
-            }
+            // Drop the existing controller; the next audio operation will lazy-init a new one.
+            Dispose();
         }
 
         public static bool ApplyAudioSettings(Core.AudioSetting audioSettings)
