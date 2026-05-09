@@ -780,17 +780,20 @@ namespace DisplayProfileManager
 
                 if (_settingsManager != null)
                 {
-                    Task.Run(async () =>
+                    // Save settings synchronously on exit. The previous code used
+                    // Task.Run(...).Wait(2 s), which silently abandoned the save if
+                    // it didn't complete in time -- combined with non-atomic writes
+                    // this was a data-loss path. SaveSettingsAsync now uses an
+                    // atomic temp+File.Replace under the hood, and we wait for it
+                    // unconditionally. A typical save is single-digit milliseconds.
+                    try
                     {
-                        try
-                        {
-                            await _settingsManager.SaveSettingsAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.Error(ex, "Error saving settings on exit");
-                        }
-                    }).Wait(TimeSpan.FromSeconds(2));
+                        _settingsManager.SaveSettingsAsync().GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.Error(ex, "Error saving settings on exit");
+                    }
                 }
             }
             catch (Exception ex)

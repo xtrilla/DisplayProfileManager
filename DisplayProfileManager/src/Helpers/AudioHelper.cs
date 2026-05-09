@@ -11,23 +11,59 @@ namespace DisplayProfileManager.Helpers
     public class AudioHelper
     {
         private static readonly Logger logger = LoggerHelper.GetLogger();
-        private static CoreAudioController _audioController;
 
-        // Device-specific caching to prevent cross-device contamination
+        // CoreAudioController is constructed transiently per audio operation, never
+        // held as static state. Reason: CoreAudioController subscribes to WASAPI
+        // session-change notifications via IMMNotificationClient on construction.
+        // With audio-active apps on the system (Outlook, Teams, browsers) those
+        // notifications fire constantly while subscribed, driving cross-process
+        // security-token allocations into the kernel paged pool. Persistent
+        // subscription -> persistent token churn until the app exits.
+        //
+        // The contract for every audio operation is: build a fresh controller,
+        // do the work, dispose it. Disposal unsubscribes from WASAPI immediately.
+        // Call cost is ~50 ms WASAPI handshake -- imperceptible for the rare
+        // operations DPM actually performs (profile switch, profile editor open).
+        // See https://github.com/zac15987/DisplayProfileManager/issues/10
+
+        // Device-name cache survives across transient controllers. Keyed by
+        // AudioSwitcher device ID (a GUID assigned by Windows that is stable
+        // across controller lifetimes), so cache reuse is correct.
         private static readonly Dictionary<string, string> _deviceSpecificNameCache = new Dictionary<string, string>();
         private static readonly Dictionary<string, DateTime> _deviceSpecificDiscoveryTime = new Dictionary<string, DateTime>();
         private static readonly object _cachelock = new object();
 
-        public static void InitializeAudio()
+        // Run an audio operation against a freshly constructed CoreAudioController,
+        // then dispose it. All reading of IDevice properties must happen inside
+        // the operation lambda -- post-dispose access to device objects is unsafe.
+        private static T WithController<T>(string opName, Func<CoreAudioController, T> op, T fallback)
         {
+            CoreAudioController c = null;
             try
             {
-                _audioController = new CoreAudioController();
+                c = new CoreAudioController();
+                return op(c);
             }
             catch (Exception ex)
             {
-                logger.Error(ex, "Failed to initialize CoreAudioController");
+                logger.Error(ex, $"Audio operation '{opName}' failed");
+                return fallback;
             }
+            finally
+            {
+                if (c != null)
+                {
+                    try { c.Dispose(); }
+                    catch (Exception ex) { logger.Warn(ex, "Error disposing transient AudioController"); }
+                }
+            }
+        }
+
+        public static void InitializeAudio()
+        {
+            // No-op: controllers are transient (constructed per audio operation).
+            // Kept for API compatibility with App.xaml.cs.
+            logger.Debug("InitializeAudio: transient-controller model -- nothing to initialise");
         }
 
         public class AudioDeviceInfo
@@ -52,24 +88,15 @@ namespace DisplayProfileManager.Helpers
 
         public static List<AudioDeviceInfo> GetPlaybackDevices()
         {
-            var devices = new List<AudioDeviceInfo>();
-
-            try
+            return WithController("GetPlaybackDevices", c =>
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return devices;
-                }
-
-                var playbackDevices = _audioController.GetPlaybackDevices(DeviceState.Active);
-
+                var devices = new List<AudioDeviceInfo>();
+                var playbackDevices = c.GetPlaybackDevices(DeviceState.Active);
                 foreach (var device in playbackDevices)
                 {
                     try
                     {
                         var systemName = GetWindowsDeviceName(device);
-
                         devices.Add(new AudioDeviceInfo
                         {
                             Id = device.Id.ToString(),
@@ -84,35 +111,21 @@ namespace DisplayProfileManager.Helpers
                         logger.Error(ex, $"Error processing playback device {device.Name}");
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error getting playback devices");
-            }
-
-            return devices;
+                return devices;
+            }, new List<AudioDeviceInfo>());
         }
 
         public static List<AudioDeviceInfo> GetCaptureDevices()
         {
-            var devices = new List<AudioDeviceInfo>();
-
-            try
+            return WithController("GetCaptureDevices", c =>
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return devices;
-                }
-
-                var captureDevices = _audioController.GetCaptureDevices(DeviceState.Active);
-
+                var devices = new List<AudioDeviceInfo>();
+                var captureDevices = c.GetCaptureDevices(DeviceState.Active);
                 foreach (var device in captureDevices)
                 {
                     try
                     {
                         var systemName = GetWindowsDeviceName(device);
-
                         devices.Add(new AudioDeviceInfo
                         {
                             Id = device.Id.ToString(),
@@ -127,161 +140,88 @@ namespace DisplayProfileManager.Helpers
                         logger.Error(ex, $"Error processing capture device {device.Name}");
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error getting capture devices");
-            }
-
-            return devices;
+                return devices;
+            }, new List<AudioDeviceInfo>());
         }
 
         public static AudioDeviceInfo GetDefaultPlaybackDevice()
         {
-            try
+            return WithController<AudioDeviceInfo>("GetDefaultPlaybackDevice", c =>
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return null;
-                }
-
-                var defaultDevice = _audioController.DefaultPlaybackDevice;
-                if (defaultDevice == null)
-                    return null;
-
-                var systemName = GetWindowsDeviceName(defaultDevice);
-
+                var d = c.DefaultPlaybackDevice;
+                if (d == null) return null;
+                var systemName = GetWindowsDeviceName(d);
                 return new AudioDeviceInfo
                 {
-                    Id = defaultDevice.Id.ToString(),
-                    Name = defaultDevice.Name,
-                    SystemName = systemName ?? defaultDevice.FullName,
-                    IsActive = defaultDevice.State == DeviceState.Active,
+                    Id = d.Id.ToString(),
+                    Name = d.Name,
+                    SystemName = systemName ?? d.FullName,
+                    IsActive = d.State == DeviceState.Active,
                     Type = DeviceType.Playback
                 };
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error getting default playback device");
-                return null;
-            }
+            }, null);
         }
 
         public static AudioDeviceInfo GetDefaultCaptureDevice()
         {
-            try
+            return WithController<AudioDeviceInfo>("GetDefaultCaptureDevice", c =>
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return null;
-                }
-
-                var defaultDevice = _audioController.DefaultCaptureDevice;
-                if (defaultDevice == null)
-                    return null;
-
-                var systemName = GetWindowsDeviceName(defaultDevice);
-
+                var d = c.DefaultCaptureDevice;
+                if (d == null) return null;
+                var systemName = GetWindowsDeviceName(d);
                 return new AudioDeviceInfo
                 {
-                    Id = defaultDevice.Id.ToString(),
-                    Name = defaultDevice.Name,
-                    SystemName = systemName ?? defaultDevice.FullName,
-                    IsActive = defaultDevice.State == DeviceState.Active,
+                    Id = d.Id.ToString(),
+                    Name = d.Name,
+                    SystemName = systemName ?? d.FullName,
+                    IsActive = d.State == DeviceState.Active,
                     Type = DeviceType.Capture
                 };
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error getting default capture device");
-                return null;
-            }
+            }, null);
         }
 
         public static bool SetDefaultPlaybackDevice(string deviceId)
         {
-            try
+            if (!Guid.TryParse(deviceId, out Guid guid))
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return false;
-                }
-
-                if (!Guid.TryParse(deviceId, out Guid guid))
-                {
-                    logger.Warn($"Invalid device ID format: {deviceId}");
-                    return false;
-                }
-
-                var device = _audioController.GetDevice(guid);
+                logger.Warn($"Invalid device ID format: {deviceId}");
+                return false;
+            }
+            return WithController("SetDefaultPlaybackDevice", c =>
+            {
+                var device = c.GetDevice(guid);
                 if (device == null)
                 {
                     logger.Warn($"Playback device not found: {deviceId}");
                     return false;
                 }
-
                 var result = device.SetAsDefault();
-                if (result)
-                {
-                    logger.Info($"Successfully set default playback device: {device.Name}");
-                }
-                else
-                {
-                    logger.Warn($"Failed to set default playback device: {device.Name}");
-                }
-
+                if (result) logger.Info($"Successfully set default playback device: {device.Name}");
+                else logger.Warn($"Failed to set default playback device: {device.Name}");
                 return result;
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error setting default playback device");
-                return false;
-            }
+            }, false);
         }
 
         public static bool SetDefaultCaptureDevice(string deviceId)
         {
-            try
+            if (!Guid.TryParse(deviceId, out Guid guid))
             {
-                if (_audioController == null)
-                {
-                    logger.Warn("AudioController is not initialized");
-                    return false;
-                }
-
-                if (!Guid.TryParse(deviceId, out Guid guid))
-                {
-                    logger.Warn($"Invalid device ID format: {deviceId}");
-                    return false;
-                }
-
-                var device = _audioController.GetDevice(guid);
+                logger.Warn($"Invalid device ID format: {deviceId}");
+                return false;
+            }
+            return WithController("SetDefaultCaptureDevice", c =>
+            {
+                var device = c.GetDevice(guid);
                 if (device == null)
                 {
                     logger.Warn($"Capture device not found: {deviceId}");
                     return false;
                 }
-
                 var result = device.SetAsDefault();
-                if (result)
-                {
-                    logger.Info($"Successfully set default capture device: {device.Name}");
-                }
-                else
-                {
-                    logger.Warn($"Failed to set default capture device: {device.Name}");
-                }
-
+                if (result) logger.Info($"Successfully set default capture device: {device.Name}");
+                else logger.Warn($"Failed to set default capture device: {device.Name}");
                 return result;
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error setting default capture device");
-                return false;
-            }
+            }, false);
         }
 
         private static string GetWindowsDeviceName(IDevice device)
@@ -679,28 +619,14 @@ namespace DisplayProfileManager.Helpers
 
         public static void Dispose()
         {
-            try
-            {
-                _audioController?.Dispose();
-                _audioController = null;
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error disposing AudioController");
-            }
+            // No-op: controllers are transient (constructed and disposed per audio
+            // operation by WithController). No persistent state to release here.
         }
 
         public static void ReInitializeAudioController()
         {
-            try
-            {
-                Dispose();
-                _audioController = new CoreAudioController();
-            }
-            catch (Exception ex)
-            {
-                logger.Error(ex, "Error re-initializing AudioController");
-            }
+            // No-op: every audio operation already constructs a fresh controller.
+            // Kept for API compatibility (called by ProfileEditWindow on device-change).
         }
 
         public static bool ApplyAudioSettings(Core.AudioSetting audioSettings)

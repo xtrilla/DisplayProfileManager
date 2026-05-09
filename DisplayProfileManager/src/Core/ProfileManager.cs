@@ -151,7 +151,7 @@ namespace DisplayProfileManager.Core
             {
                 var filePath = GetProfileFilePath(profile.Id);
                 var json = JsonConvert.SerializeObject(profile, Formatting.Indented);
-                await Task.Run(() => File.WriteAllText(filePath, json));
+                await Task.Run(() => AtomicWriteAllText(filePath, json));
                 return true;
             }
             catch (Exception ex)
@@ -878,5 +878,26 @@ namespace DisplayProfileManager.Core
         }
 
         private readonly SettingsManager _settingsManager = SettingsManager.Instance;
+
+        // Crash-safe write. The previous implementation used File.WriteAllText, which
+        // truncates the destination first; if the process crashed (or AV/power loss
+        // raced) between the truncate and the final write, the profile JSON could be
+        // left at zero bytes -- losing that profile permanently. Writes go to a
+        // sibling .tmp first, then atomically replace the destination via
+        // File.Replace (NTFS-atomic). On the first save (no existing destination)
+        // it falls back to a Move.
+        private static void AtomicWriteAllText(string path, string content)
+        {
+            var tmp = path + ".tmp";
+            File.WriteAllText(tmp, content);
+            if (File.Exists(path))
+            {
+                File.Replace(tmp, path, null);
+            }
+            else
+            {
+                File.Move(tmp, path);
+            }
+        }
     }
 }
