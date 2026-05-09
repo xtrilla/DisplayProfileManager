@@ -655,13 +655,16 @@ namespace DisplayProfileManager
         {
             try
             {
-                _profileEditWindowCount--;
+                // Clamp at 0 to survive the unbalanced-pair case: if Window_Loaded
+                // fired (incrementing) but the constructor failed before subscribing
+                // the Closed handler, the decrement here is the first signal the
+                // window ever closed -- don't let the count go negative.
+                _profileEditWindowCount = Math.Max(0, _profileEditWindowCount - 1);
                 logger.Debug($"ProfileEditWindow closed. Count: {_profileEditWindowCount}");
 
                 // Only re-enable when all ProfileEditWindows are closed
-                if (_profileEditWindowCount <= 0 && _hotkeysDisabledForEditing)
+                if (_profileEditWindowCount == 0 && _hotkeysDisabledForEditing)
                 {
-                    _profileEditWindowCount = 0; // Ensure it doesn't go negative
                     _hotkeysDisabledForEditing = false;
                     RegisterAllProfileHotkeys();
                     logger.Info("Re-enabled profile hotkeys after editing");
@@ -706,10 +709,17 @@ namespace DisplayProfileManager
             }
             catch (Exception ex)
             {
+                // async-void: this is a top-level handler, an unhandled exception
+                // here would crash the process. ShowNotification can throw if the
+                // tray icon is being disposed during shutdown, so guard explicitly.
                 logger.Error(ex, $"Error applying profile {profileId} via hotkey");
-                _trayIcon?.ShowNotification("Display Profile Manager",
-                    "Error applying profile via hotkey",
-                    System.Windows.Forms.ToolTipIcon.Error);
+                try
+                {
+                    _trayIcon?.ShowNotification("Display Profile Manager",
+                        "Error applying profile via hotkey",
+                        System.Windows.Forms.ToolTipIcon.Error);
+                }
+                catch { /* swallow: tray icon disposed or unavailable */ }
             }
         }
 

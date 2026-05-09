@@ -197,8 +197,17 @@ namespace DisplayProfileManager.UI
                 }
                 catch (Exception ex)
                 {
-                    _notifyIcon.ShowBalloonTip(5000, "Display Profile Manager",
-                        $"Error applying profile: {ex.Message}", ToolTipIcon.Error);
+                    // Async-void: any unhandled exception here would crash the
+                    // process via SynchronizationContext post. ShowBalloonTip
+                    // can throw if the icon is being disposed during shutdown,
+                    // so guard it explicitly.
+                    logger.Error(ex, $"Error applying profile '{profile.Name}' from tray");
+                    try
+                    {
+                        _notifyIcon?.ShowBalloonTip(5000, "Display Profile Manager",
+                            $"Error applying profile: {ex.Message}", ToolTipIcon.Error);
+                    }
+                    catch { /* swallow: tray icon disposed or unavailable */ }
                 }
             }
         }
@@ -219,13 +228,22 @@ namespace DisplayProfileManager.UI
             {
                 await _profileManager.LoadProfilesAsync();
                 BuildContextMenu();
-                _notifyIcon.ShowBalloonTip(2000, "Display Profile Manager",
-                    "Profiles refreshed", ToolTipIcon.Info);
+                try
+                {
+                    _notifyIcon?.ShowBalloonTip(2000, "Display Profile Manager",
+                        "Profiles refreshed", ToolTipIcon.Info);
+                }
+                catch { /* swallow: tray icon disposed */ }
             }
             catch (Exception ex)
             {
-                _notifyIcon.ShowBalloonTip(5000, "Display Profile Manager",
-                    $"Error refreshing profiles: {ex.Message}", ToolTipIcon.Error);
+                logger.Error(ex, "Error refreshing profiles from tray");
+                try
+                {
+                    _notifyIcon?.ShowBalloonTip(5000, "Display Profile Manager",
+                        $"Error refreshing profiles: {ex.Message}", ToolTipIcon.Error);
+                }
+                catch { /* swallow: tray icon disposed */ }
             }
         }
 
